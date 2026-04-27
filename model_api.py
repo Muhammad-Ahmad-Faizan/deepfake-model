@@ -1,0 +1,388 @@
+"""
+Model API Server for Deepfake Detection
+This service runs the PyTorch model and provides REST API endpoints
+"""
+
+from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
+from contextlib import asynccontextmanager
+import torch
+import cv2
+import numpy as np
+from torchvision import transforms
+import timm
+import torch.nn as nn
+from pathlib import Path
+import json
+import os
+import tempfile
+from datetime import datetime
+
+# Model architecture (must match training)
+class DeepfakeDetector(nn.Module):
+    def __init__(self):
+        super(DeepfakeDetector, self).__init__()
+        self.backbone = timm.create_model('efficientnet_b0', pretrained=False, num_classes=0)
+        self.classifier = nn.Sequential(
+            nn.Linear(1280, 512),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(512, 256),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(256, 1),
+            nn.Sigmoid()
+        )
+    
+    def forward(self, x):
+        features = self.backbone(x)
+        output = self.classifier(features)
+        return output
+
+# Global model variable
+model = None
+device = None
+
+def load_model():
+    """Load the trained model"""
+    global model, device
+    
+    try:
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print(f"Using device: {device}")
+        
+        model_path = Path(__file__).parent / "model_output" / "final_model.pth"
+        
+        if not model_path.exists():
+            print(f"⚠️ Model file not found at {model_path}")
+            print("⚠️ Running in demo mode with random predictions")
+            return False
+        
+        model = DeepfakeDetector()
+        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
+        model.load_state_dict(checkpoint['model_state_dict'])
+        model.to(device)
+        model.eval()
+        
+        print(f"✅ Model loaded successfully from {model_path}")
+        return True
+    except Exception as e:
+        print(f"❌ Error loading model: {e}")
+        print("⚠️ Running in demo mode with random predictions")
+        return False
+
+# Load model on startup
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    load_model()
+    yield
+    # Shutdown
+    pass
+
+# Create FastAPI app
+app = FastAPI(
+    title="Deepfake Detection Model API", 
+    version="1.0.0",
+    lifespan=lifespan
+)
+
+# CORS middleware
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Mount static files for annotated frames
+analysis_results_dir = os.path.join(os.path.dirname(__file__), 'analysis_results')
+os.makedirs(analysis_results_dir, exist_ok=True)
+app.mount("/model/analysis_results", StaticFiles(directory=analysis_results_dir), name="analysis_results")
+
+def extract_frames(video_path, num_frames=10, frame_rate=15):
+    """Extract frames from video"""
+    frames = []
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    
+    frame_count = 0
+    extracted = 0
+    
+    while extracted < num_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if frame_count % frame_rate == 0:
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame_rgb)
+            extracted += 1
+        
+        frame_count += 1
+    
+    cap.release()
+    
+    if len(frames) == 0:
+        raise ValueError("No frames extracted from video")
+    
+    return frames
+
+def preprocess_frame(frame):
+    """Preprocess a single frame for the model"""
+    transform = transforms.Compose([
+        transforms.ToPILImage(),
+        transforms.Resize((224, 224)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    return transform(frame)
+
+def save_annotated_frames(video_path, raw_frames, predictions):
+    """Save annotated frames with face detection"""
+    import cv2
+    
+    # Create results folder
+    video_name = os.path.splitext(os.path.basename(video_path))[0]
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_folder = os.path.join(os.path.dirname(__file__), 'analysis_results', f"{video_name}_{timestamp}")
+    frames_folder = os.path.join(output_folder, 'frames')
+    os.makedirs(frames_folder, exist_ok=True)
+    
+    # Load face detector
+    haarcascade_path = os.path.join(os.path.dirname(__file__), 'haarcascade_frontalface_default.xml')
+    face_cascade = cv2.CascadeClassifier(haarcascade_path)
+    
+    annotated_paths = []
+    frame_details = []
+    
+    for i, (raw_frame, pred_score) in enumerate(zip(raw_frames, predictions)):
+        # Detect faces
+        gray = cv2.cvtColor(raw_frame, cv2.COLOR_BGR2GRAY)
+        faces = face_cascade.detectMultiScale(gray, 1.3, 5)
+        
+        # Create annotated frame
+        annotated = raw_frame.copy()
+        h, w = annotated.shape[:2]
+        
+        label = "FAKE" if pred_score > 0.5 else "REAL"
+        confidence = float(pred_score * 100 if pred_score > 0.5 else (1 - pred_score) * 100)
+        
+        color = (0, 0, 255) if label == "FAKE" else (0, 255, 0)
+        
+        # Draw face boxes
+        for (x, y, fw, fh) in faces:
+            cv2.rectangle(annotated, (x, y), (x+fw, y+fh), color, 4)
+            text = f"{label} FACE"
+            cv2.rectangle(annotated, (x, y-30), (x+150, y), color, -1)
+            cv2.putText(annotated, text, (x+5, y-10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        # Add header overlay
+        overlay = annotated.copy()
+        cv2.rectangle(overlay, (0, 0), (w, 80), color, -1)
+        cv2.addWeighted(overlay, 0.3, annotated, 0.7, 0, annotated)
+        
+        # Add text
+        cv2.putText(annotated, f"Frame {i+1}", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        cv2.putText(annotated, f"{label}: {confidence:.1f}%", (10, 65), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (255, 255, 255), 3)
+        
+        # Save frame
+        frame_filename = f"frame_{i+1:02d}_{label}.jpg"
+        frame_path = os.path.join(frames_folder, frame_filename)
+        cv2.imwrite(frame_path, annotated)
+        
+        annotated_paths.append(frame_path)
+        frame_details.append({
+            "frame_num": i + 1,
+            "label": label,
+            "confidence": confidence,
+            "raw_score": float(pred_score),
+            "is_suspicious": bool(pred_score > 0.5),
+            "faces_detected": int(len(faces))
+        })
+    
+    return output_folder, annotated_paths, frame_details
+
+def analyze_video_with_model(video_path):
+    """Analyze video using the loaded model"""
+    global model, device
+    
+    if model is None:
+        # Demo mode - return random results
+        import random
+        is_fake = random.choice([True, False])
+        confidence = random.uniform(60, 95)
+        
+        return {
+            "is_deepfake": is_fake,
+            "confidence_score": confidence,
+            "analysis_details": {
+                "mode": "demo",
+                "facial_consistency": random.uniform(50, 95),
+                "audio_sync": random.uniform(50, 95),
+                "artifacts_detected": random.choice([True, False]),
+                "frame_analysis": {
+                    "total_frames": random.randint(100, 500),
+                    "suspicious_frames": random.randint(0, 50)
+                },
+                "annotated_frames": []
+            }
+        }
+    
+    # Extract frames (these are RGB frames for processing)
+    frames = extract_frames(video_path)
+    
+    # Extract raw frames again (BGR for OpenCV annotation)
+    raw_frames = []
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        raise ValueError(f"Cannot open video: {video_path}")
+    
+    frame_count = 0
+    extracted = 0
+    num_frames = 10
+    frame_rate = 15
+    
+    while extracted < num_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        if frame_count % frame_rate == 0:
+            raw_frames.append(frame)  # Keep as BGR
+            extracted += 1
+        
+        frame_count += 1
+    
+    cap.release()
+    
+    # Ensure we have the same number of frames
+    if len(raw_frames) != len(frames):
+        min_len = min(len(raw_frames), len(frames))
+        raw_frames = raw_frames[:min_len]
+        frames = frames[:min_len]
+    
+    # Preprocess frames
+    processed_frames = torch.stack([preprocess_frame(frame) for frame in frames])
+    processed_frames = processed_frames.to(device)
+    
+    # Run inference
+    with torch.no_grad():
+        predictions = model(processed_frames)
+        predictions = predictions.cpu().numpy().flatten()
+    
+    # Save annotated frames
+    output_folder, annotated_paths, frame_details = save_annotated_frames(video_path, raw_frames, predictions)
+    
+    # Calculate metrics
+    avg_prediction = float(np.mean(predictions))
+    is_deepfake = bool(avg_prediction > 0.5)
+    confidence_score = float(avg_prediction * 100 if is_deepfake else (1 - avg_prediction) * 100)
+    
+    # Count suspicious frames
+    suspicious_count = int(np.sum(predictions > 0.5))
+    fake_frames = suspicious_count
+    real_frames = len(predictions) - suspicious_count
+    
+    # Calculate consistency score based on variance
+    consistency_score = float((1 - np.std(predictions)) * 100)
+    
+    # Detailed analysis
+    analysis_details = {
+        "mode": "model",
+        "facial_consistency": consistency_score,
+        "temporal_consistency": float(100 - (np.std(predictions) * 150)),  # Inverse of variance
+        "artifacts_detected": bool(suspicious_count > len(frames) * 0.3),
+        "frame_analysis": {
+            "total_frames": len(frames),
+            "suspicious_frames": suspicious_count,
+            "fake_frames": fake_frames,
+            "real_frames": real_frames,
+            "frame_scores": predictions.tolist(),
+            "frame_details": frame_details
+        },
+        "annotated_frames": [os.path.relpath(p, os.path.dirname(os.path.dirname(__file__))) for p in annotated_paths],
+        "output_folder": output_folder
+    }
+    
+    return {
+        "is_deepfake": is_deepfake,
+        "confidence_score": confidence_score,
+        "analysis_details": analysis_details
+    }
+
+@app.get("/")
+async def root():
+    return {
+        "message": "Deepfake Detection Model API",
+        "version": "1.0.0",
+        "status": "running",
+        "model_loaded": model is not None
+    }
+
+@app.get("/health")
+async def health_check():
+    return {
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "device": str(device) if device else "not initialized"
+    }
+
+@app.post("/analyze")
+async def analyze_video(file: UploadFile = File(...)):
+    """Analyze a video file for deepfake detection"""
+    
+    # Validate file type
+    if not file.filename.lower().endswith(('.mp4', '.avi', '.mov', '.webm')):
+        raise HTTPException(status_code=400, detail="Invalid file type. Only video files are supported.")
+    
+    # Save uploaded file temporarily
+    temp_dir = tempfile.gettempdir()
+    temp_path = os.path.join(temp_dir, f"temp_video_{datetime.now().timestamp()}.mp4")
+    
+    try:
+        # Save file
+        with open(temp_path, "wb") as f:
+            content = await file.read()
+            f.write(content)
+        
+        # Analyze video
+        result = analyze_video_with_model(temp_path)
+        
+        return result
+        
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analyzing video: {str(e)}")
+    
+    finally:
+        # Cleanup
+        if os.path.exists(temp_path):
+            try:
+                os.remove(temp_path)
+            except:
+                pass
+
+@app.post("/analyze-path")
+async def analyze_video_path(video_path: str):
+    """Analyze a video file by path"""
+    
+    if not os.path.exists(video_path):
+        raise HTTPException(status_code=404, detail="Video file not found")
+    
+    try:
+        result = analyze_video_with_model(video_path)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error analyzing video: {str(e)}")
+
+if __name__ == "__main__":
+    import uvicorn
+    print("🚀 Starting Deepfake Detection Model API...")
+    print("📝 API will be available at: http://localhost:5000")
+    print("📝 API Documentation: http://localhost:5000/docs")
+    uvicorn.run(app, host="0.0.0.0", port=5000)
