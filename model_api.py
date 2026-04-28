@@ -3,7 +3,7 @@ Model API Server for Deepfake Detection
 This service runs the PyTorch model and provides REST API endpoints
 """
 
-from fastapi import FastAPI, File, UploadFile, HTTPException
+from fastapi import FastAPI, File, UploadFile, HTTPException, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
@@ -14,10 +14,15 @@ from torchvision import transforms
 import timm
 import torch.nn as nn
 from pathlib import Path
-import json
 import os
 import tempfile
 from datetime import datetime
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 # Model architecture (must match training)
 class DeepfakeDetector(nn.Module):
@@ -40,43 +45,105 @@ class DeepfakeDetector(nn.Module):
         output = self.classifier(features)
         return output
 
-# Global model variable
+# Global model runtime state
 model = None
 device = None
+loaded_model_key = None
+loaded_model_path = None
 
-def load_model():
-    """Load the trained model"""
-    global model, device
-    
+
+def get_available_model_files():
+    """Return available checkpoint files in model_output as {key, label, path}."""
+    model_dir = Path(__file__).parent / "model_output"
+    if not model_dir.exists():
+        return []
+
+    files = []
+    for pth_file in sorted(model_dir.glob("*.pth")):
+        files.append({
+            "key": pth_file.stem,
+            "label": pth_file.name,
+            "path": pth_file,
+        })
+    return files
+
+
+def resolve_model_path(model_key: str | None):
+    available = get_available_model_files()
+    if not available:
+        return None
+
+    if model_key:
+        for model_file in available:
+            if model_file["key"] == model_key:
+                return model_file["path"]
+
+    # Prefer final_model if present, otherwise first file.
+    for model_file in available:
+        if model_file["key"] == "final_model":
+            return model_file["path"]
+
+    return available[0]["path"]
+
+
+def extract_state_dict(checkpoint):
+    """Handle different checkpoint formats."""
+    if isinstance(checkpoint, dict):
+        if "model_state_dict" in checkpoint:
+            return checkpoint["model_state_dict"]
+        if "state_dict" in checkpoint:
+            return checkpoint["state_dict"]
+    return checkpoint
+
+
+def load_model(model_key: str | None = None):
+    """Load selected trained model checkpoint into memory."""
+    global model, device, loaded_model_key, loaded_model_path
+
     try:
-        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        print(f"Using device: {device}")
-        
-        model_path = Path(__file__).parent / "model_output" / "final_model.pth"
-        
-        if not model_path.exists():
-            print(f"⚠️ Model file not found at {model_path}")
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            print(f"Using device: {device}")
+
+        model_path = resolve_model_path(model_key)
+
+        if model_path is None:
+            print("⚠️ No model files found in model_output")
             print("⚠️ Running in demo mode with random predictions")
+            model = None
+            loaded_model_key = None
+            loaded_model_path = None
             return False
-        
-        model = DeepfakeDetector()
+
+        if loaded_model_path == str(model_path) and model is not None:
+            return True
+
+        detector = DeepfakeDetector()
         checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.to(device)
-        model.eval()
-        
+        state_dict = extract_state_dict(checkpoint)
+        detector.load_state_dict(state_dict, strict=False)
+        detector.to(device)
+        detector.eval()
+
+        model = detector
+        loaded_model_key = model_path.stem
+        loaded_model_path = str(model_path)
         print(f"✅ Model loaded successfully from {model_path}")
         return True
     except Exception as e:
         print(f"❌ Error loading model: {e}")
         print("⚠️ Running in demo mode with random predictions")
+        model = None
+        loaded_model_key = None
+        loaded_model_path = None
         return False
+
 
 # Load model on startup
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
-    load_model()
+    load_model(os.getenv("DEFAULT_MODEL_KEY", "final_model"))
     yield
     # Shutdown
     pass
@@ -207,10 +274,14 @@ def save_annotated_frames(video_path, raw_frames, predictions):
     
     return output_folder, annotated_paths, frame_details
 
-def analyze_video_with_model(video_path):
-    """Analyze video using the loaded model"""
-    global model, device
-    
+def analyze_video_with_model(video_path, model_key: str | None = None):
+    """Analyze video using the selected model."""
+    global model, device, loaded_model_key
+
+    # Switch model when requested by client.
+    if model_key and model_key != loaded_model_key:
+        load_model(model_key)
+
     if model is None:
         # Demo mode - return random results
         import random
@@ -295,6 +366,8 @@ def analyze_video_with_model(video_path):
     # Detailed analysis
     analysis_details = {
         "mode": "model",
+        "model_key": loaded_model_key,
+        "model_file": os.path.basename(loaded_model_path) if loaded_model_path else None,
         "facial_consistency": consistency_score,
         "temporal_consistency": float(100 - (np.std(predictions) * 150)),  # Inverse of variance
         "artifacts_detected": bool(suspicious_count > len(frames) * 0.3),
@@ -322,7 +395,8 @@ async def root():
         "message": "Deepfake Detection Model API",
         "version": "1.0.0",
         "status": "running",
-        "model_loaded": model is not None
+        "model_loaded": model is not None,
+        "loaded_model_key": loaded_model_key,
     }
 
 @app.get("/health")
@@ -330,11 +404,26 @@ async def health_check():
     return {
         "status": "healthy",
         "model_loaded": model is not None,
-        "device": str(device) if device else "not initialized"
+        "device": str(device) if device else "not initialized",
+        "loaded_model_key": loaded_model_key,
+        "loaded_model_path": loaded_model_path,
+    }
+
+@app.get("/models")
+async def list_models():
+    available = get_available_model_files()
+    return {
+        "models": [
+            {"key": model_file["key"], "label": model_file["label"]}
+            for model_file in available
+        ]
     }
 
 @app.post("/analyze")
-async def analyze_video(file: UploadFile = File(...)):
+async def analyze_video(
+    file: UploadFile = File(...),
+    model_key: str = Form("final_model"),
+):
     """Analyze a video file for deepfake detection"""
     
     # Validate file type
@@ -351,8 +440,8 @@ async def analyze_video(file: UploadFile = File(...)):
             content = await file.read()
             f.write(content)
         
-        # Analyze video
-        result = analyze_video_with_model(temp_path)
+        # Analyze video with selected model key
+        result = analyze_video_with_model(temp_path, model_key=model_key)
         
         return result
         
@@ -368,14 +457,14 @@ async def analyze_video(file: UploadFile = File(...)):
                 pass
 
 @app.post("/analyze-path")
-async def analyze_video_path(video_path: str):
+async def analyze_video_path(video_path: str, model_key: str = "final_model"):
     """Analyze a video file by path"""
     
     if not os.path.exists(video_path):
         raise HTTPException(status_code=404, detail="Video file not found")
     
     try:
-        result = analyze_video_with_model(video_path)
+        result = analyze_video_with_model(video_path, model_key=model_key)
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error analyzing video: {str(e)}")
