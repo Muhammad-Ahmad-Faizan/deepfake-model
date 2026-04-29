@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: deepfake-model-api
+    runtime: python-3.12
+    buildCommand: pip install -r requirements.txt
+    startCommand: python model_api.py
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.12

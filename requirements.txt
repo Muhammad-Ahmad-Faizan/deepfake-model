@@ -1,10 +1,10 @@
 # Core libraries
-numpy==1.24.3
-pandas==2.0.3
+numpy>=2.1.0
+pandas>=2.2.0
 
 # PyTorch (install separately with: pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu)
-torch>=2.0.0
-torchvision>=0.15.0
+torch>=2.2.0
+torchvision>=0.17.0
 
 # Model (EfficientNet)
 timm>=0.9.0
