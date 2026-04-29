@@ -471,7 +471,8 @@ async def analyze_video_path(video_path: str, model_key: str = "final_model"):
 
 if __name__ == "__main__":
     import uvicorn
+    port = int(os.getenv("PORT", 5000))
     print("🚀 Starting Deepfake Detection Model API...")
-    print("📝 API will be available at: http://localhost:5000")
-    print("📝 API Documentation: http://localhost:5000/docs")
-    uvicorn.run(app, host="0.0.0.0", port=5000)
+    print(f"📝 API will be available at: http://0.0.0.0:{port}")
+    print(f"📝 API Documentation: http://0.0.0.0:{port}/docs")
+    uvicorn.run(app, host="0.0.0.0", port=port)
